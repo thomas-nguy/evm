@@ -575,6 +575,17 @@ func getTransactionReceipt(t *testing.T, hash hexutil.Bytes) map[string]interfac
 	return receipt
 }
 
+func getBlockReceipts(t *testing.T, hash hexutil.Bytes) []map[string]interface{} {
+	param := []string{hash.String()}
+	rpcRes := call(t, "eth_getBlockReceipts", param)
+
+	var receipt []map[string]interface{}
+	err := json.Unmarshal(rpcRes.Result, &receipt)
+	require.NoError(t, err)
+
+	return receipt
+}
+
 func waitForReceipt(t *testing.T, hash hexutil.Bytes) map[string]interface{} {
 	timeout := time.After(12 * time.Second)
 	ticker := time.Tick(500 * time.Millisecond)
@@ -587,6 +598,23 @@ func waitForReceipt(t *testing.T, hash hexutil.Bytes) map[string]interface{} {
 			receipt := getTransactionReceipt(t, hash)
 			if receipt != nil {
 				return receipt
+			}
+		}
+	}
+}
+
+func waitForBlockReceipts(t *testing.T, hash hexutil.Bytes) []map[string]interface{} {
+	timeout := time.After(12 * time.Second)
+	ticker := time.Tick(500 * time.Millisecond)
+
+	for {
+		select {
+		case <-timeout:
+			return nil
+		case <-ticker:
+			receipts := getBlockReceipts(t, hash)
+			if receipts != nil {
+				return receipts
 			}
 		}
 	}
@@ -941,4 +969,15 @@ func makeEthTxParam() []map[string]string {
 	param[0]["gasPrice"] = "0x55ae82600"
 
 	return param
+}
+
+func TestEth_GetBlockReceipt(t *testing.T) {
+	hash := sendTestTransaction(t)
+
+	receipts := waitForBlockReceipts(t, hash)
+
+	require.NotNil(t, receipts, "transaction failed")
+	require.Equal(t, 1, len(receipts))
+	require.Equal(t, "0x1", receipts[0]["status"].(string))
+	require.Equal(t, []interface{}{}, receipts[0]["logs"].([]interface{}))
 }

@@ -4,13 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
-	"math/big"
-	"strings"
-
 	"github.com/ethereum/go-ethereum/core/vm"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"math"
+	"math/big"
 
 	"github.com/pkg/errors"
 	"github.com/spf13/viper"
@@ -28,8 +26,6 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/crypto"
-
 	"github.com/tharsis/ethermint/crypto/hd"
 	"github.com/tharsis/ethermint/rpc/ethereum/backend"
 	rpctypes "github.com/tharsis/ethermint/rpc/ethereum/types"
@@ -582,111 +578,13 @@ func (e *PublicAPI) GetTransactionByBlockNumberAndIndex(blockNum rpctypes.BlockN
 func (e *PublicAPI) GetTransactionReceipt(hash common.Hash) (map[string]interface{}, error) {
 	hexTx := hash.Hex()
 	e.logger.Debug("eth_getTransactionReceipt", "hash", hexTx)
+	return e.backend.GetTransactionReceipt(hash, nil)
+}
 
-	res, err := e.backend.GetTxByEthHash(hash)
-	if err != nil {
-		e.logger.Debug("tx not found", "hash", hexTx, "error", err.Error())
-		return nil, nil
-	}
-
-	resBlock, err := e.clientCtx.Client.Block(e.ctx, &res.Height)
-	if err != nil {
-		e.logger.Debug("block not found", "height", res.Height, "error", err.Error())
-		return nil, nil
-	}
-
-	tx, err := e.clientCtx.TxConfig.TxDecoder()(res.Tx)
-	if err != nil {
-		e.logger.Debug("decoding failed", "error", err.Error())
-		return nil, fmt.Errorf("failed to decode tx: %w", err)
-	}
-
-	msg, err := evmtypes.UnwrapEthereumMsg(&tx)
-	if err != nil {
-		e.logger.Debug("invalid tx", "error", err.Error())
-		return nil, err
-	}
-
-	txData, err := evmtypes.UnpackTxData(msg.Data)
-	if err != nil {
-		e.logger.Error("failed to unpack tx data", "error", err.Error())
-		return nil, err
-	}
-
-	cumulativeGasUsed := uint64(0)
-	blockRes, err := e.clientCtx.Client.BlockResults(e.ctx, &res.Height)
-	if err != nil {
-		e.logger.Debug("failed to retrieve block results", "height", res.Height, "error", err.Error())
-		return nil, nil
-	}
-
-	for i := 0; i <= int(res.Index) && i < len(blockRes.TxsResults); i++ {
-		cumulativeGasUsed += uint64(blockRes.TxsResults[i].GasUsed)
-	}
-
-	// Get the transaction result from the log
-	var status hexutil.Uint
-	if strings.Contains(res.TxResult.GetLog(), evmtypes.AttributeKeyEthereumTxFailed) {
-		status = hexutil.Uint(ethtypes.ReceiptStatusFailed)
-	} else {
-		status = hexutil.Uint(ethtypes.ReceiptStatusSuccessful)
-	}
-
-	from, err := msg.GetSender(e.chainIDEpoch)
-	if err != nil {
-		return nil, err
-	}
-
-	logs, err := e.backend.GetTransactionLogs(hash)
-	if err != nil {
-		e.logger.Debug("logs not found", "hash", hexTx, "error", err.Error())
-	}
-
-	// get eth index based on block's txs
-	var txIndex uint64
-	msgs := e.backend.GetEthereumMsgsFromTendermintBlock(resBlock)
-	for i := range msgs {
-		if msgs[i].Hash == hexTx {
-			txIndex = uint64(i)
-			break
-		}
-	}
-
-	receipt := map[string]interface{}{
-		// Consensus fields: These fields are defined by the Yellow Paper
-		"status":            status,
-		"cumulativeGasUsed": hexutil.Uint64(cumulativeGasUsed),
-		"logsBloom":         ethtypes.BytesToBloom(ethtypes.LogsBloom(logs)),
-		"logs":              logs,
-
-		// Implementation fields: These fields are added by geth when processing a transaction.
-		// They are stored in the chain database.
-		"transactionHash": hash,
-		"contractAddress": nil,
-		"gasUsed":         hexutil.Uint64(res.TxResult.GasUsed),
-		"type":            hexutil.Uint(txData.TxType()),
-
-		// Inclusion information: These fields provide information about the inclusion of the
-		// transaction corresponding to this receipt.
-		"blockHash":        common.BytesToHash(resBlock.Block.Header.Hash()).Hex(),
-		"blockNumber":      hexutil.Uint64(res.Height),
-		"transactionIndex": hexutil.Uint64(txIndex),
-
-		// sender and receiver (contract or EOA) addreses
-		"from": from,
-		"to":   txData.GetTo(),
-	}
-
-	if logs == nil {
-		receipt["logs"] = [][]*ethtypes.Log{}
-	}
-
-	// If the ContractAddress is 20 0x0 bytes, assume it is not a contract creation
-	if txData.GetTo() == nil {
-		receipt["contractAddress"] = crypto.CreateAddress(from, txData.GetNonce())
-	}
-
-	return receipt, nil
+// GetBlockReceipts returns a list of transaction receipts given a block number.
+func (e *PublicAPI) GetBlockReceipts(blockNum rpctypes.BlockNumber) ([]map[string]interface{}, error) {
+	e.logger.Debug("eth_getBlockReceipts", "number", blockNum)
+	return e.backend.GetBlockReceipts(blockNum)
 }
 
 // GetPendingTransactions returns the transactions that are in the transaction pool

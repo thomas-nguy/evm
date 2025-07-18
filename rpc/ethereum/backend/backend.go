@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/ethereum/go-ethereum/crypto"
 	"math/big"
 	"strconv"
+	"strings"
 
 	"github.com/cosmos/cosmos-sdk/client/flags"
 	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
@@ -65,6 +67,8 @@ type Backend interface {
 	SuggestGasTipCap() (*big.Int, error)
 	GetFilteredBlocks(from int64, to int64, filter [][]filters.BloomIV, filterAddresses bool) ([]int64, error)
 	GetEthereumMsgsFromTendermintBlock(block *tmrpctypes.ResultBlock) []*evmtypes.MsgEthereumTx
+	GetTransactionReceipt(hash common.Hash, resBlockResult *tmrpctypes.ResultBlockResults) (map[string]interface{}, error)
+	GetBlockReceipts(blockNum types.BlockNumber) ([]map[string]interface{}, error)
 }
 
 var _ Backend = (*EVMBackend)(nil)
@@ -879,6 +883,185 @@ func (e *EVMBackend) GetEthereumMsgsFromTendermintBlock(block *tmrpctypes.Result
 			ethTx, err := e.GetTxByEthHash(hash)
 			if err != nil || ethTx.Height != block.Block.Height {
 				e.logger.Debug("failed to query eth tx hash", "hash", hash.Hex())
+				continue
+			}
+
+			result = append(result, ethMsg)
+		}
+	}
+
+	return result
+}
+
+// GetTransactionReceipt returns the transaction receipt identified by hash. It takes an optional resBlockResult, if nil then the method will fetch it.
+func (e *EVMBackend) GetTransactionReceipt(hash common.Hash, resBlockResult *tmrpctypes.ResultBlockResults) (map[string]interface{}, error) {
+	res, err := e.GetTxByEthHash(hash)
+	if err != nil {
+		e.logger.Debug("tx not found", "hash", hash.Hex(), "error", err.Error())
+		return nil, nil
+	}
+
+	resBlock, err := e.clientCtx.Client.Block(e.ctx, &res.Height)
+	if err != nil {
+		e.logger.Debug("block not found", "height", res.Height, "error", err.Error())
+		return nil, nil
+	}
+
+	tx, err := e.clientCtx.TxConfig.TxDecoder()(res.Tx)
+	if err != nil {
+		e.logger.Debug("decoding failed", "error", err.Error())
+		return nil, fmt.Errorf("failed to decode tx: %w", err)
+	}
+
+	msg, err := evmtypes.UnwrapEthereumMsg(&tx)
+	if err != nil {
+		e.logger.Debug("invalid tx", "error", err.Error())
+		return nil, err
+	}
+
+	txData, err := evmtypes.UnpackTxData(msg.Data)
+	if err != nil {
+		e.logger.Error("failed to unpack tx data", "error", err.Error())
+		return nil, err
+	}
+
+	cumulativeGasUsed := uint64(0)
+	if resBlockResult == nil {
+		resBlockResult, err = e.clientCtx.Client.BlockResults(e.ctx, &res.Height)
+		if err != nil {
+			e.logger.Debug("failed to retrieve block results", "height", res.Height, "error", err.Error())
+			return nil, nil
+		}
+	}
+
+	for i := 0; i <= int(res.Index) && i < len(resBlockResult.TxsResults); i++ {
+		cumulativeGasUsed += uint64(resBlockResult.TxsResults[i].GasUsed)
+	}
+
+	// Get the transaction result from the log
+	var status hexutil.Uint
+	if strings.Contains(res.TxResult.GetLog(), evmtypes.AttributeKeyEthereumTxFailed) {
+		status = hexutil.Uint(ethtypes.ReceiptStatusFailed)
+	} else {
+		status = hexutil.Uint(ethtypes.ReceiptStatusSuccessful)
+	}
+
+	from, err := msg.GetSender(e.chainID)
+	if err != nil {
+		return nil, err
+	}
+
+	logs, err := e.GetTransactionLogs(hash)
+	if err != nil {
+		e.logger.Debug("logs not found", "hash", hash.Hex(), "error", err.Error())
+	}
+
+	// get eth index based on block's txs
+	var txIndex uint64
+	msgs := e.GetEthereumMsgsFromTendermintBlock(resBlock)
+	for i := range msgs {
+		if msgs[i].Hash == hash.Hex() {
+			txIndex = uint64(i)
+			break
+		}
+	}
+
+	receipt := map[string]interface{}{
+		// Consensus fields: These fields are defined by the Yellow Paper
+		"status":            status,
+		"cumulativeGasUsed": hexutil.Uint64(cumulativeGasUsed),
+		"logsBloom":         ethtypes.BytesToBloom(ethtypes.LogsBloom(logs)),
+		"logs":              logs,
+
+		// Implementation fields: These fields are added by geth when processing a transaction.
+		// They are stored in the chain database.
+		"transactionHash": hash,
+		"contractAddress": nil,
+		"gasUsed":         hexutil.Uint64(res.TxResult.GasUsed),
+		"type":            hexutil.Uint(txData.TxType()),
+
+		// Inclusion information: These fields provide information about the inclusion of the
+		// transaction corresponding to this receipt.
+		"blockHash":        common.BytesToHash(resBlock.Block.Header.Hash()).Hex(),
+		"blockNumber":      hexutil.Uint64(res.Height),
+		"transactionIndex": hexutil.Uint64(txIndex),
+
+		// sender and receiver (contract or EOA) addreses
+		"from": from,
+		"to":   txData.GetTo(),
+	}
+
+	if logs == nil {
+		receipt["logs"] = [][]*ethtypes.Log{}
+	}
+
+	// If the ContractAddress is 20 0x0 bytes, assume it is not a contract creation
+	if txData.GetTo() == nil {
+		receipt["contractAddress"] = crypto.CreateAddress(from, txData.GetNonce())
+	}
+
+	return receipt, nil
+}
+
+// GetBlockReceipts returns a list of Ethereum transaction receipts given a block number
+func (e *EVMBackend) GetBlockReceipts(blockNum types.BlockNumber) ([]map[string]interface{}, error) {
+	tmResBlock, err := e.GetTendermintBlockByNumber(blockNum)
+	if err != nil {
+		return nil, err
+	}
+
+	// return if requested block height is greater than the current one
+	if tmResBlock == nil || tmResBlock.Block == nil {
+		return nil, nil
+	}
+
+	ctx := types.ContextWithHeight(tmResBlock.Block.Height)
+	resBlockResult, err := e.clientCtx.Client.BlockResults(ctx, &tmResBlock.Block.Height)
+
+	msgs := e.ethMsgsFromTendermintBlock(tmResBlock, resBlockResult)
+	txHashes := make([]string, 0, len(msgs))
+	for _, ethMsg := range msgs {
+		txHashes = append(txHashes, ethMsg.Hash)
+	}
+
+	res := make([]map[string]interface{}, 0, len(txHashes))
+	for _, txHash := range txHashes {
+		receipt, err := e.GetTransactionReceipt(common.HexToHash(txHash), resBlockResult)
+		if err != nil {
+			return nil, err
+		}
+		res = append(res, receipt)
+	}
+
+	return res, nil
+}
+
+// EthMsgsFromTendermintBlock returns all real MsgEthereumTxs from a
+// Tendermint block. It also ensures consistency over the correct txs indexes
+// across RPC endpoints
+func (e *EVMBackend) ethMsgsFromTendermintBlock(
+	resBlock *tmrpctypes.ResultBlock,
+	blockRes *tmrpctypes.ResultBlockResults,
+) []*evmtypes.MsgEthereumTx {
+	var result []*evmtypes.MsgEthereumTx
+	block := resBlock.Block
+	txResults := blockRes.TxsResults
+
+	for i, tx := range block.Txs {
+		if txResults[i].Code != 0 {
+			e.logger.Debug("invalid tx result code", "cosmos-hash", hexutil.Encode(tx.Hash()))
+			continue
+		}
+
+		tx, err := e.clientCtx.TxConfig.TxDecoder()(tx)
+		if err != nil {
+			e.logger.Debug("failed to decode transaction in block", "height", block.Height, "error", err.Error())
+			continue
+		}
+
+		for _, msg := range tx.GetMsgs() {
+			ethMsg, ok := msg.(*evmtypes.MsgEthereumTx)
+			if !ok {
 				continue
 			}
 
